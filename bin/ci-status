@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""ci-status: one line per CI check for a pull request, on GitHub (gh) or Gitea (tea).
+
+Every call reads the PR's current head and its checks afresh, so there is no job id
+to go stale. Exit codes: 0 green, 1 red, 2 still running, 3 no checks yet, 4 error.
+
+  ci-status [PR]                  status now (PR defaults to the current branch's)
+  ci-status PR --wait             poll until nothing is running, then report
+  ci-status PR --logs             also print the tail of each failed job's log,
+                                  with lines that look like infrastructure trouble
+  ci-status PR --rerun-failed     re-run the failed jobs of the current head
+  ci-status PR --json             machine-readable (--all also lists skipped checks)
+
+Run it from inside the repository, or pass --dir.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from urllib.parse import urlparse
+
+PASS, FAIL, PENDING, SKIP = "pass", "fail", "pending", "skip"
+EXIT = {"success": 0, "failure": 1, "pending": 2, "none": 3}
+
+# Lines in a failed log that point at the runner or the network rather than the code.
+INFRA = re.compile(
+    r"status code (429|50[0-9])|HTTP[ /][0-9.]* ?(429|50[0-9])|Too Many Requests|Gateway Time-?out"
+    r"|Could not resolve host|Temporary failure in name resolution|Connection (reset|refused|timed out)"
+    r"|TLS handshake timeout|No space left on device|OutOfMemory|out of memory|Killed\s*$"
+    r"|runner .*(lost|offline)|The operation was canceled",
+    re.IGNORECASE,
+)
+
+ERROR = re.compile(r"##\[error\]|--- FAIL|\bFAIL\b|FAILED|panic:|\b[Ee]rror:|exit (code|status) [1-9]|failed with exit")
+DONE = re.compile(r"Process completed with exit code|^\S*\s*(Job failed|job '.*' failed)\s*$")
+
+FAILMARK = re.compile(r"--- FAIL:|\|\s+FAIL\s+\S|^\S*\s*FAIL\s+\S|\bFAILED\b|✘|\d+ failed")
+
+
+class Error(Exception):
+    pass
+
+
+def sh(args, cwd, check=True):
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise Error(f"{' '.join(args[:3])}… failed: {(r.stderr or r.stdout).strip()[-400:]}")
+    return r
+
+
+def loads(text):
+    try:
+        return json.loads(text, strict=False)
+    except json.JSONDecodeError as e:
+        raise Error(f"not JSON ({e}): {text.strip()[:200]}")
+
+
+def parse_remote(url):
+    """git@host:owner/repo(.git), ssh://git@host:port/owner/repo, https://host/owner/repo."""
+    m = re.match(r"^[\w.-]+@([^:/]+):(.+?)(?:\.git)?/?$", url)
+    if m:
+        return m.group(1), m.group(2)
+    u = urlparse(url)
+    if u.hostname:
+        return u.hostname, re.sub(r"\.git$", "", u.path.strip("/"))
+    raise Error(f"cannot read remote url {url!r}")
+
+
+class GitHub:
+    tool = "gh"
+
+    def __init__(self, cwd, host, slug):
+        self.cwd, self.repo = cwd, f"{host}/{slug}" if host != "github.com" else slug
+
+    def head(self, pr):
+        args = ["gh", "pr", "view"] + ([str(pr)] if pr else []) + ["--repo", self.repo, "--json", "number,headRefOid,url"]
+        d = loads(sh(args, self.cwd).stdout)
+        return d["number"], d["headRefOid"], d["url"]
+
+    def checks(self, pr, sha):
+        r = sh(["gh", "pr", "checks", str(pr), "--repo", self.repo, "--json", "name,bucket,link,workflow"], self.cwd, check=False)
+        if r.returncode not in (0, 1, 8) or not r.stdout.strip():
+            if "no checks" in (r.stderr + r.stdout).lower():
+                return []
+            raise Error(f"gh pr checks failed: {(r.stderr or r.stdout).strip()[-400:]}")
+        out = []
+        for c in loads(r.stdout):
+            b = c["bucket"]
+            state = {"pass": PASS, "fail": FAIL, "cancel": FAIL, "pending": PENDING}.get(b, SKIP)
+            m = re.search(r"/runs/(\d+)/job/(\d+)", c.get("link") or "")
+            out.append({"name": c["name"], "state": state, "raw": b, "url": c.get("link"),
+                        "run": m and m.group(1), "job": m and m.group(2)})
+        return out
+
+    def log(self, check):
+        if not check["job"]:
+            return ""
+        r = sh(["gh", "run", "view", "--repo", self.repo, "--job", check["job"], "--log-failed"], self.cwd, check=False)
+        return r.stdout or r.stderr
+
+    def rerun(self, failed):
+        for run in sorted({c["run"] for c in failed if c["run"]}):
+            sh(["gh", "run", "rerun", run, "--failed", "--repo", self.repo], self.cwd)
+            print(f"re-ran failed jobs of run {run}")
+
+
+class Gitea:
+    tool = "tea"
+
+    def __init__(self, cwd, login, base, slug):
+        self.cwd, self.login, self.base, self.slug = cwd, login, base.rstrip("/"), slug
+
+    def api(self, path, method=None):
+        args = ["tea", "api", "--login", self.login] + (["-X", method] if method else []) + [path]
+        return sh(args, self.cwd).stdout
+
+    def head(self, pr):
+        if not pr:
+            branch = sh(["git", "branch", "--show-current"], self.cwd).stdout.strip()
+            pulls = loads(self.api(f"repos/{self.slug}/pulls?state=open&limit=50"))
+            match = [p for p in pulls if p["head"]["ref"] == branch]
+            if not match:
+                raise Error(f"no open PR for branch {branch!r}; pass the PR number")
+            pr = match[0]["number"]
+        d = loads(self.api(f"repos/{self.slug}/pulls/{pr}"))
+        if "head" not in d:
+            raise Error(f"#{pr} is not a pull request in {self.slug}: {d.get('message', d)}")
+        return d["number"], d["head"]["sha"], d["html_url"]
+
+    def checks(self, pr, sha):
+        d = loads(self.api(f"repos/{self.slug}/commits/{sha}/status"))
+        out = []
+        for s in d.get("statuses") or []:
+            raw = s.get("status") or s.get("state")
+            state = {"success": PASS, "failure": FAIL, "error": FAIL, "warning": FAIL,
+                     "pending": PENDING, "running": PENDING}.get(raw, SKIP)
+            m = re.search(r"/runs/(\d+)/jobs/(\d+)", s.get("target_url") or "")
+            url = s.get("target_url") or ""
+            out.append({"name": s["context"], "state": state, "raw": raw,
+                        "url": self.base + url if url.startswith("/") else url,
+                        "run": m and m.group(1), "job": m and m.group(2)})
+        return out
+
+    def job_id(self, check):
+        """The status URL carries the job's index in its run; the API wants its id."""
+        jobs = loads(self.api(f"repos/{self.slug}/actions/runs/{check['run']}/jobs")).get("jobs") or []
+        name = re.sub(r"^.*? / | \(.*\)$", "", check["name"])
+        for j in jobs:
+            if j.get("name") == name or str(j.get("id")) == check["job"]:
+                return str(j["id"])
+        return check["job"]
+
+    def log(self, check):
+        if not check["run"]:
+            return ""
+        r = sh(["tea", "actions", "runs", "logs", check["run"], "--job", self.job_id(check),
+                "--login", self.login, "--repo", self.slug], self.cwd, check=False)
+        return r.stdout or r.stderr
+
+    def rerun(self, failed):
+        for c in failed:
+            if c["run"]:
+                self.api(f"repos/{self.slug}/actions/runs/{c['run']}/jobs/{self.job_id(c)}/rerun", method="POST")
+                print(f"re-ran {c['name']} (run {c['run']})")
+
+
+def forge(cwd, remote):
+    url = sh(["git", "remote", "get-url", remote], cwd).stdout.strip()
+    host, slug = parse_remote(url)
+    if host == "github.com" or host.startswith("github."):
+        return GitHub(cwd, host, slug)
+    logins = loads(sh(["tea", "login", "list", "-o", "json"], cwd).stdout)
+    for lg in logins:
+        if host in (urlparse(lg["url"]).hostname, lg.get("ssh_host")):
+            return Gitea(cwd, lg["name"], lg["url"], slug)
+    domain = ".".join(host.split(".")[-2:])  # ssh.example.dev → a login on git.example.dev
+    for lg in logins:
+        if (urlparse(lg["url"]).hostname or "").endswith(domain):
+            return Gitea(cwd, lg["name"], lg["url"], slug)
+    raise Error(f"{host} is neither GitHub nor a tea login (tea login list)")
+
+
+def overall(checks):
+    if not checks:
+        return "none"
+    states = {c["state"] for c in checks}
+    if PENDING in states:
+        return "pending"
+    return "failure" if FAIL in states else "success"
+
+
+def report(f, pr, sha, url, checks, as_json, show_skipped=False):
+    o = overall(checks)
+    if as_json:
+        print(json.dumps({"pr": pr, "head": sha, "url": url, "overall": o, "tool": f.tool, "checks": checks}, indent=2))
+        return o
+    order = {FAIL: 0, PENDING: 1, PASS: 2, SKIP: 3}
+    for c in sorted(checks, key=lambda c: (order[c["state"]], c["name"])):
+        if c["state"] == SKIP and not show_skipped:
+            continue
+        where = f"  run {c['run']} job {c['job']}" if c["run"] else ""
+        print(f"{c['state'].upper():8}{c['name']}{where}")
+    counts = {s: sum(c["state"] == s for c in checks) for s in (PASS, FAIL, PENDING, SKIP)}
+    print(f"overall={o} pr={pr} head={sha[:10]} passed={counts[PASS]} failed={counts[FAIL]} "
+          f"running={counts[PENDING]} skipped={counts[SKIP]}  {url}")
+    return o
+
+
+def print_logs(f, failed, lines):
+    for c in failed:
+        text = f.log(c)
+        all_lines = text.rstrip().splitlines()
+        # The log ends in checkout cleanup; show the lines up to the last error instead.
+        hits = [i for i, ln in enumerate(all_lines) if ERROR.search(ln) and not DONE.search(ln)]
+        end = hits[-1] + 3 if hits else len(all_lines)
+        tail = all_lines[max(0, end - lines):end]
+        infra = [ln.strip() for ln in all_lines if INFRA.search(ln)]
+        print(f"\n===== {c['name']} (run {c['run']} job {c['job']}) — {len(tail)} lines up to the last error =====")
+        print("\n".join(tail))
+        marks = [ln.strip() for ln in all_lines if FAILMARK.search(ln)]
+        if marks:
+            print(f"----- failure lines ({len(marks)}), first 20:")
+            print("\n".join(list(dict.fromkeys(marks))[:20]))
+        if infra:
+            print(f"----- infra-suspect lines ({len(infra)}), last 5:")
+            print("\n".join(infra[-5:]))
+        else:
+            print("----- no infra-suspect lines: treat as a code or test failure")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("pr", nargs="?", type=int)
+    ap.add_argument("--dir", default=".")
+    ap.add_argument("--remote", default="origin")
+    ap.add_argument("--wait", action="store_true")
+    ap.add_argument("--interval", type=int, default=60, help="seconds between polls (default 60)")
+    ap.add_argument("--timeout", type=int, default=7200, help="give up waiting after this many seconds (default 7200)")
+    ap.add_argument("--grace", type=int, default=900,
+                    help="with --wait, how long 'no checks yet' counts as still starting (default 900)")
+    ap.add_argument("--logs", action="store_true")
+    ap.add_argument("--lines", type=int, default=60)
+    ap.add_argument("--rerun-failed", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--all", action="store_true", help="also list skipped checks")
+    a = ap.parse_args()
+
+    try:
+        f = forge(a.dir, a.remote)
+        pr, sha, url = f.head(a.pr)
+        checks = f.checks(pr, sha)
+        start, last = time.time(), None
+        while a.wait:
+            o = overall(checks)
+            elapsed = time.time() - start
+            if o not in ("pending", "none") or (o == "none" and elapsed > a.grace) or elapsed > a.timeout:
+                break
+            line = f"{time.strftime('%H:%M')} {o} head={sha[:10]} " + " ".join(
+                f"{s}={sum(c['state'] == s for c in checks)}" for s in (PASS, FAIL, PENDING))
+            if line[6:] != (last or "")[6:]:
+                print(line, flush=True)
+            last = line
+            time.sleep(a.interval)
+            pr, new_sha, url = f.head(pr)
+            if new_sha != sha:
+                print(f"head moved {sha[:10]} → {new_sha[:10]}; following the new head", flush=True)
+                sha, start = new_sha, time.time()
+            checks = f.checks(pr, sha)
+
+        o = report(f, pr, sha, url, checks, a.json, a.all)
+        failed = [c for c in checks if c["state"] == FAIL]
+        if a.wait and o in ("pending", "none"):
+            print(f"stopped waiting after {int(time.time() - start)}s: still {o}")
+        if a.logs and failed:
+            print_logs(f, failed, a.lines)
+        if a.rerun_failed:
+            if not failed:
+                print("nothing failed; nothing re-run")
+            else:
+                f.rerun(failed)
+        return EXIT[o]
+    except Error as e:
+        print(f"ci-status: {e}", file=sys.stderr)
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())
